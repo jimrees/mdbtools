@@ -187,13 +187,16 @@ enum {
 static gboolean mdb_drop_backend(gpointer key, gpointer value, gpointer data);
 
 static gchar*
-quote_generic(const gchar *value, gchar quote_char, gchar escape_char) {
+quote_generic(const gchar *value, gchar quote_char, gchar escape_char, int (*xform)(int)) {
 	gchar *result, *pr;
 	unsigned char c;
 
 	pr = result = g_malloc(1+4*strlen(value)+2); // worst case scenario
 
-	*pr++ = quote_char;
+    if (quote_char != '\0') {
+        *pr++ = quote_char;
+    }
+
 	while ((c=*(unsigned char*)value++)) {
 		if (c<32) {
 			sprintf(pr, "\\%03o", c);
@@ -203,9 +206,13 @@ quote_generic(const gchar *value, gchar quote_char, gchar escape_char) {
 		else if (c == quote_char) {
 			*pr++ = escape_char;
 		}
-		*pr++ = c;
+		*pr++ = xform ? xform(c) : c;
 	}
-	*pr++ = quote_char;
+
+	if (quote_char) {
+        *pr++ = quote_char;
+    }
+
 	*pr++ = '\0';
 	return result;
 }
@@ -225,14 +232,47 @@ static gchar*
 quote_schema_name_dquote(const gchar* schema, const gchar *name)
 {
 	if (schema) {
-		gchar *frag1 = quote_generic(schema, '"', '"');
-		gchar *frag2 = quote_generic(name, '"', '"');
+		gchar *frag1 = quote_generic(schema, '"', '"', NULL);
+		gchar *frag2 = quote_generic(name, '"', '"', NULL);
 		gchar *result = g_strconcat(frag1, ".", frag2, NULL);
 		g_free(frag1);
 		g_free(frag2);
 		return result;
 	}
-	return quote_generic(name, '"', '"');
+	return quote_generic(name, '"', '"', NULL);
+}
+
+/*
+ * For backends that really does support schema
+ * returns "name" or "schema"."name"
+ */
+static gchar*
+quote_schema_name_dquote_tolower(const gchar* schema, const gchar *name)
+{
+	if (schema) {
+		gchar *frag1 = quote_generic(schema, '"', '"', tolower);
+		gchar *frag2 = quote_generic(name, '"', '"', tolower);
+		gchar *result = g_strconcat(frag1, ".", frag2, NULL);
+		g_free(frag1);
+		g_free(frag2);
+		return result;
+	}
+	return quote_generic(name, '"', '"', tolower);
+}
+
+static gchar*
+quote_schema_name_unquoted(const gchar* schema, const gchar *name)
+{
+    if (schema) {
+        gchar* frag1 = quote_generic(schema, 0, '"', NULL);
+        gchar* frag2 = quote_generic(name, 0, '"', NULL);
+        gchar* result = g_strconcat(frag1, ".", frag2, NULL);
+        g_free(frag1);
+        g_free(frag2);
+        return result;
+    }
+    else
+        return quote_generic(name, 0, '"', NULL);
 }
 
 /*
@@ -257,17 +297,17 @@ quote_schema_name_rquotes_merge(const gchar* schema, const gchar *name)
 {
 	if (schema) {
 		gchar *combined = g_strconcat(schema, "_", name, NULL);
-		gchar *result = quote_generic(combined, '`', '`');
+		gchar *result = quote_generic(combined, '`', '`', NULL);
 		g_free(combined);
 		return result;
 	}
-	return quote_generic(name, '`', '`');
+	return quote_generic(name, '`', '`', NULL);
 }
 
 static gchar*
 quote_with_squotes(const gchar* value)
 {
-	return quote_generic(value, '\'', '\'');
+	return quote_generic(value, '\'', '\'', NULL);
 }
 
 MDB_DEPRECATED(char*,
@@ -392,6 +432,26 @@ MDB_CONSTRUCTOR(_mdb_init_backends)
 		"COMMENT ON COLUMN %s.%s IS %s;\n",
 		"COMMENT ON TABLE %s IS %s;\n",
 		quote_schema_name_dquote);
+	mdb_register_backend("postgres-unquoted",
+		MDB_SHEXP_DROPTABLE|MDB_SHEXP_CST_NOTNULL|MDB_SHEXP_CST_NOTEMPTY|MDB_SHEXP_COMMENTS|MDB_SHEXP_INDEXES|MDB_SHEXP_RELATIONS|MDB_SHEXP_DEFVALUES,
+		mdb_postgres_types, &mdb_postgres_shortdate_type, &mdb_postgres_serial_type,
+		"current_date", "now()",
+		"SET client_encoding = '%s';\n",
+		"DROP TABLE IF EXISTS %s;\n",
+		"ALTER TABLE %s ADD CHECK (%s <>'');\n",
+		"COMMENT ON COLUMN %s.%s IS %s;\n",
+		"COMMENT ON TABLE %s IS %s;\n",
+        quote_schema_name_unquoted);
+	mdb_register_backend("postgres-tolower",
+		MDB_SHEXP_DROPTABLE|MDB_SHEXP_CST_NOTNULL|MDB_SHEXP_CST_NOTEMPTY|MDB_SHEXP_COMMENTS|MDB_SHEXP_INDEXES|MDB_SHEXP_RELATIONS|MDB_SHEXP_DEFVALUES,
+		mdb_postgres_types, &mdb_postgres_shortdate_type, &mdb_postgres_serial_type,
+		"current_date", "now()",
+		"SET client_encoding = '%s';\n",
+		"DROP TABLE IF EXISTS %s;\n",
+		"ALTER TABLE %s ADD CHECK (%s <>'');\n",
+		"COMMENT ON COLUMN %s.%s IS %s;\n",
+		"COMMENT ON TABLE %s IS %s;\n",
+        quote_schema_name_dquote_tolower);
 	mdb_register_backend("mysql",
 		MDB_SHEXP_DROPTABLE|MDB_SHEXP_CST_NOTNULL|MDB_SHEXP_CST_NOTEMPTY|MDB_SHEXP_INDEXES|MDB_SHEXP_DEFVALUES,
 		mdb_mysql_types, &mdb_mysql_shortdate_type, NULL,
@@ -502,7 +562,7 @@ mdb_print_indexes(FILE* outfile, MdbTableDef *table, char *dbnamespace)
 	MdbColumn *col;
 
 
-	if (!strcmp(mdb->backend_name, "postgres")) {
+	if (!strncmp(mdb->backend_name, "postgres", 8)) {
 		backend = MDB_BACKEND_POSTGRES;
 	} else if (!strcmp(mdb->backend_name, "mysql")) {
 		backend = MDB_BACKEND_MYSQL;
@@ -618,7 +678,7 @@ mdb_get_relationships(MdbHandle *mdb, const gchar *dbnamespace, const char* tabl
 
 	if (!strcmp(mdb->backend_name, "oracle")) {
 		backend = MDB_BACKEND_ORACLE;
-	} else if (!strcmp(mdb->backend_name, "postgres")) {
+	} else if (!strncmp(mdb->backend_name, "postgres", 8)) {
 		backend = MDB_BACKEND_POSTGRES;
 	} else if (!strcmp(mdb->backend_name, "sqlite")) {
 		backend = MDB_BACKEND_SQLITE;
