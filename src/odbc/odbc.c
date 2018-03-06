@@ -25,6 +25,7 @@
 #include <sqlext.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include "mdbodbc.h"
 
 //#define TRACE(x) fprintf(stderr,"Function %s\n", x);
@@ -1586,6 +1587,7 @@ static SQLRETURN SQL_API _SQLGetData(
 	MdbColumn *col;
 	MdbTableDef *table;
 	int i, intValue;
+	double doubleValue;
 
 	TRACE("_SQLGetData");
 	stmt = (struct _hstmt *) hstmt;
@@ -1722,22 +1724,76 @@ static SQLRETURN SQL_API _SQLGetData(
 				if (pcbValue)
 					*pcbValue = sizeof(SQLINTEGER);
 				break;
+
+#if ODBCVER >= 0x0300
+            case SQL_C_SBIGINT:
+                *(ODBCINT64*)rgbValue = intValue; /* sign extension */
+                if (pcbValue)
+                    *pcbValue = sizeof(ODBCINT64);
+                break;
+
+            case SQL_C_UBIGINT:
+                if (intValue < 0) {
+					strcpy(sqlState, "22003"); // Numeric value out of range
+					return SQL_ERROR;
+				}
+                *(UODBCINT64*)rgbValue = (unsigned)intValue; /* no sign extension */
+                if (pcbValue)
+                    *pcbValue = sizeof(UODBCINT64);
+                break;
+#endif
+
 			default:
 				strcpy(sqlState, "HYC00"); // Not implemented
 				return SQL_ERROR;
 			}
 			break;
+
 		// case MDB_MONEY: TODO
+
 		case MDB_FLOAT:
-			*(float*)rgbValue = mdb_get_single(mdb->pg_buf, col->cur_value_start);
-			if (pcbValue)
-				*pcbValue = sizeof(float);
+			switch(fCType) {
+			case SQL_C_FLOAT:
+				*(float*)rgbValue = mdb_get_single(mdb->pg_buf, col->cur_value_start);
+				if (pcbValue)
+					*pcbValue = sizeof(float);
+				break;
+			case SQL_C_DOUBLE:
+				*(double*)rgbValue = mdb_get_single(mdb->pg_buf, col->cur_value_start);
+				if (pcbValue)
+					*pcbValue = sizeof(double);
+				break;
+			default:
+				strcpy(sqlState, "HYC00"); // Not implemented
+				return SQL_ERROR;
+			}
 			break;
+
 		case MDB_DOUBLE:
-			*(double*)rgbValue = mdb_get_double(mdb->pg_buf, col->cur_value_start);
-			if (pcbValue)
-			  *pcbValue = sizeof(double);
+			doubleValue = mdb_get_double(mdb->pg_buf, col->cur_value_start);
+			switch(fCType) {
+			case SQL_C_FLOAT:
+				if (isfinite(doubleValue) && fabs(doubleValue) > FLT_MAX) {
+					strcpy(sqlState, "22003"); // Numeric value out of range
+					return SQL_ERROR;
+				}
+				*(float*)rgbValue = doubleValue;
+				if (pcbValue)
+					*pcbValue = sizeof(float);
+				break;
+
+			case SQL_C_DOUBLE:
+				*(double*)rgbValue = doubleValue;
+				if (pcbValue)
+					*pcbValue = sizeof(double);
+				break;
+
+			default:
+				strcpy(sqlState, "HYC00"); // Not implemented
+				return SQL_ERROR;
+			}
 			break;
+
 #if ODBCVER >= 0x0300
 		// returns text if old odbc
 		case MDB_DATETIME:
